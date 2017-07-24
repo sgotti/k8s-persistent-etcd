@@ -1,0 +1,111 @@
+{{ range $i := until 3 }}
+# A service that matches one pod (managed by the below statefulset with replicas = 1) to provide a stable ip.
+# Once the etcd cluster has been created don't delete/recreate these services since
+# their ip will change and the etcd peer list will contain the old one causing a
+# cluster to become unquorate. And this will block any operation to manually fix
+# peers ip using `etcdctl member update` since this cannot be done on an
+# unquorate cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: "etcd-{{ $i }}"
+spec:
+  ports:
+  - port: 2379
+    name: client
+  - port: 2380
+    name: peer
+  selector:
+    component: "etcd-{{ $i }}"
+---
+# A statefulset with replicas = 1 used to provide "at most one" availability of
+# the pod. At most one is foundamental (associated with the need to fencing) when
+# using a persistent volume provider that doesn't guarantee that it'll could be
+# attached to at most one node at a time to avoid data corruptions.
+# The replicas value must be 1 and must not be changed.
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: "etcd-{{ $i }}"
+  labels:
+    component: "etcd-{{ $i }}"
+spec:
+  serviceName: "etcd-{{ $i }}"
+  replicas: 1
+  template:
+    metadata:
+      name: "etcd-{{ $i }}"
+      labels:
+        component: "etcd-{{ $i }}"
+    spec:
+      containers:
+      - name: "etcd"
+        image: "quay.io/coreos/etcd:v3.2.3"
+        ports:
+        - containerPort: 2379
+          name: client
+        - containerPort: 2380
+          name: peer
+        env:
+        - name: ID
+          value: "{{ $i }}"
+        - name: CLUSTER_SIZE
+          value: "3"
+        - name: SERVICES_PREFIX
+          value: "etcd"
+        volumeMounts:
+        - name: data
+          mountPath: /var/run/etcd
+        command:
+          - "/bin/sh"
+          - "-ecx"
+          - |
+            IP=$(hostname -i)
+
+            while true; do
+              ## resolve service names to their cluster ip
+              SERVICE_ADDRESS=$(getent hosts ${SERVICES_PREFIX}-${ID} | awk '{ print $1 }')
+              # break loop if addr isn't empty
+              [ "${SERVICE_ADDRESS}" != "" ] && break
+              sleep 1
+            done
+
+            PEERS=""
+            for i in $(seq 0 $((${CLUSTER_SIZE} - 1))); do
+              while true; do
+                ## resolve service names to their cluster ip
+                addr=$(getent hosts ${SERVICES_PREFIX}-${i} | awk '{ print $1 }')
+                # break loop if addr isn't empty
+                [ "${addr}" != "" ] && break
+                sleep 1
+              done
+              PEERS="${PEERS}${PEERS:+,}${SERVICES_PREFIX}-${i}=http://${addr}:2380"
+            done
+
+            # start etcd. If cluster is already initialized the `--initial-*` options will be ignored.
+            exec etcd --name ${SERVICES_PREFIX}-${ID} \
+              --listen-peer-urls http://${IP}:2380 \
+              --listen-client-urls http://${IP}:2379,http://127.0.0.1:2379 \
+              --advertise-client-urls http://${SERVICE_ADDRESS}:2379 \
+              --initial-advertise-peer-urls http://${SERVICE_ADDRESS}:2380 \
+              --initial-cluster-token etcd-cluster-1 \
+              --initial-cluster ${PEERS} \
+              --initial-cluster-state new \
+              --data-dir /var/run/etcd/default.etcd
+## We are using dynamic pv provisioning using the "standard" storage class so
+## this resource can be directly deployed without changes to minikube (since
+## minikube defines this class for its minikube hostpath provisioner). In
+## production define your own way to use pv claims.
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      annotations:
+        volume.alpha.kubernetes.io/storage-class: standard
+    spec:
+      accessModes:
+        - "ReadWriteOnce"
+      resources:
+        requests:
+          storage: 1Gi
+---
+{{ end }}
